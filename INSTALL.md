@@ -1,5 +1,10 @@
 # 安装 / 卸载
 
+## 更新
+
+**安装与更新是同一个动作**：对已安装的机器重跑 `node install.mjs` 即为更新——
+旧版本自动备份到 `zcode-extensions\\backups\\<时间戳>\\`，可随时回滚。无需先卸载。
+
 ## 方式一：一键脚本（推荐）
 
 ```
@@ -57,12 +62,22 @@ node install.mjs --dsh-home <目录>     # 显式指定 DSH_HOME(默认 %USERPRO
 | 发图片 | 模型能描述图片内容（附件通道） |
 | 点停止 | DSH 侧对应轮次取消 |
 
-## 卸载 / 回滚
+## 卸载
 
-1. 从 `zcode-extensions\backups\<时间戳>\` 还原旧版本（如有）；
-2. 把 profile `package.json` 里两个依赖改回原值或删除；
-3. 删除 `node_modules\dsh-zcode-cli` 与 `node_modules\@local\zcode-bridge`（或重跑 pnpm install）；
-4. 重启 DSH。
+```
+node install.mjs --uninstall           # 移除依赖+node_modules,重启 DSH 后插件不再加载
+node install.mjs --uninstall --purge   # 连 zcode-extensions 程序副本与备份一并清理
+```
+
+手工卸载：从 profile `package.json` 删除两个依赖、删除 `node_modules\dsh-zcode-cli` 与
+`node_modules\@local\zcode-bridge`、重启 DSH。运行时数据目录 `%USERPROFILE%\.zcode-bridge`
+（token/日志）默认保留，确认不需要时手动删除。
+
+## 回滚到旧版本
+
+每次安装/更新前，旧版本自动备份到 `zcode-extensions\backups\<时间戳>\`。回滚：
+把备份目录的内容复制回 `zcode-extensions\dsh-zcode-cli`（或 `zcode-bridge`），
+重跑 `node install.mjs`（它会把备份副本重新物化进 node_modules），重启 DSH。
 
 ## 常见问题
 
