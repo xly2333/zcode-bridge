@@ -59,3 +59,9 @@ pollIntervalMs: 1200
 [旧 source 入口](<zcode-bridge/src/bridge.mjs>) 与 [旧 endpoint 入口](<zcode-bridge/src/llm-endpoint.mjs>) 仅保留兼容导出；作为主脚本运行时输出插件管理提示后结束。[旧 CMD](<zcode-bridge/services.cmd>) 和 [旧 shell 启动器](<zcode-bridge/start-services.sh>) 同样退役，旧计划任务通过这些入口运行会结束而不会再启动独立服务。
 
 标准操作是启动 DSH；这份文档取代早期的手工启动服务说明。真实 DSH 加载状态与最新验证结果见 [自动启停说明](<zcode-bridge/README-autostart.md>)。
+
+## 2026-11-19 全量审计修复
+
+- progress 通道只累加 text 块（此前 reasoning 块也被累进 progressText，桌面端把思考当正文流式渲染）；sessionEvents 异常时跳过该 tick 而不是抛错。
+- /v1/messages 流式收尾重构：进度叙述、正文、思考各占独立块（动态块号），修复叙述块永不闭合、思考块撞号、完整正文发两遍三个问题；无进度流时思考块在前（标准协议顺序）。
+- localFilePart 的 Windows 反斜杠常量修正（2 字符 → 1 字符，UNC 检查误伤普通路径的文件名截取）。

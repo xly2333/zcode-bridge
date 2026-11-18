@@ -418,7 +418,7 @@ function localFilePart(name, filePath) {
   }
   try {
     const bytes = readFileSync(p)
-    const slash = Math.max(p.lastIndexOf('\\\\'), p.lastIndexOf('/'))
+    const slash = Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/'))
     const displayName = name && name !== 'attachment' ? name : slash >= 0 ? p.slice(slash + 1) : p
     if (bytes.length <= 65536 && !bytes.subarray(0, 8192).includes(0)) {
       return `[附件 ${displayName} 内容开始]\\n${bytes.toString('utf8')}\\n[附件 ${displayName} 内容结束]`
@@ -859,26 +859,39 @@ async function handle(req, res) {
     const abort = state.controller
     let streamedText = ''
     let streamStarted = false
+    let nextBlockIndex = 0
+    let summaryBlock = -1
+    let textBlock = -1
     const startStream = () => {
       if (streamStarted || !wantStream || res.writableEnded || res.destroyed) return
       streamStarted = true
       res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive' })
       res.write('event: message_start\ndata: ' + JSON.stringify({ type: 'message_start', message: { id: 'msg_' + randomUUID().replaceAll('-', '').slice(0, 16), type: 'message', role: 'assistant', model: body?.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } }) + '\n\n')
-      res.write('event: content_block_start\ndata: ' + JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }) + '\n\n')
+      // 2026-11-19 重构:块号动态分配,进度叙述/正文/思考各占独立块——
+      // 旧实现叙述与正文共用块 0,finalize 的思考块撞号(0 重复)且叙述块永不闭合。
     }
-    const sendTextDelta = (text) => {
-      if (!text || res.writableEnded || res.destroyed) return
-      startStream()
-      res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } }) + '\n\n')
+    const writeBlockStart = (idx, type) => {
+      if (res.writableEnded || res.destroyed) return
+      res.write('event: content_block_start\ndata: ' + JSON.stringify({ type: 'content_block_start', index: idx, content_block: { type, text: '' } }) + '\n\n')
+    }
+    const writeDelta = (idx, delta) => {
+      if (res.writableEnded || res.destroyed) return
+      res.write('event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: idx, delta }) + '\n\n')
     }
     const onProgress = (update) => {
       if (!wantStream || res.writableEnded || res.destroyed) return
-      if (typeof update.text === 'string' && update.text.startsWith(streamedText)) {
-        const delta = update.text.slice(streamedText.length)
+      startStream()
+      // 正文独占自己的块:进度文本是累计前缀时增量下发
+      if (typeof update.text === 'string' && update.text.startsWith(streamedText) && update.text.length > streamedText.length) {
+        if (textBlock < 0) { textBlock = nextBlockIndex++; writeBlockStart(textBlock, 'text') }
+        writeDelta(textBlock, { type: 'text_delta', text: update.text.slice(streamedText.length) })
         streamedText = update.text
-        sendTextDelta(delta)
       }
-      for (const summary of Array.isArray(update.summaries) ? update.summaries : []) sendTextDelta(`\\n[DSH] ${summary}\\n`)
+      // 进程叙述([DSH] 正在执行工具…)进独立块,绝不与正文混流
+      for (const summary of Array.isArray(update.summaries) ? update.summaries : []) {
+        if (summaryBlock < 0) { summaryBlock = nextBlockIndex++; writeBlockStart(summaryBlock, 'text') }
+        writeDelta(summaryBlock, { type: 'text_delta', text: `[DSH] ${summary}\n` })
+      }
     }
 
     let answer
@@ -915,14 +928,8 @@ async function handle(req, res) {
     const send = (evt, data) => {
       if (!res.writableEnded && !res.destroyed) res.write(`event: ${evt}\ndata: ${JSON.stringify(data)}\n\n`)
     }
-    if (!streamStarted) startStream()
-    const finalDelta = answer.text.startsWith(streamedText) ? answer.text.slice(streamedText.length) : ''
-    sendTextDelta(finalDelta)
-    send('content_block_stop', { type: 'content_block_stop', index: 0 })
     const CH = 400
-    let idx = 1
-
-    if (answer.reasoning) {
+    const emitThinkingBlock = (idx) => {
       send('content_block_start', {
         type: 'content_block_start',
         index: idx,
@@ -942,23 +949,45 @@ async function handle(req, res) {
         delta: { type: 'signature_delta', signature: thinkingSignature() },
       })
       send('content_block_stop', { type: 'content_block_stop', index: idx })
-      idx++
     }
-
-    const bodyText = answer.text || ''
-    send('content_block_start', {
-      type: 'content_block_start',
-      index: idx,
-      content_block: { type: 'text', text: '' },
-    })
-    for (let i = 0; i < bodyText.length; i += CH) {
-      send('content_block_delta', {
-        type: 'content_block_delta',
+    const emitTextBlock = (idx, body) => {
+      send('content_block_start', {
+        type: 'content_block_start',
         index: idx,
-        delta: { type: 'text_delta', text: bodyText.slice(i, i + CH) },
+        content_block: { type: 'text', text: '' },
       })
+      for (let i = 0; i < body.length; i += CH) {
+        send('content_block_delta', {
+          type: 'content_block_delta',
+          index: idx,
+          delta: { type: 'text_delta', text: body.slice(i, i + CH) },
+        })
+      }
+      send('content_block_stop', { type: 'content_block_stop', index: idx })
     }
-    send('content_block_stop', { type: 'content_block_stop', index: idx })
+    if (!streamStarted) startStream()
+    // 2026-11-19 收尾(动态块号):先闭合进度叙述块,再按标准顺序补思考块与正文块。
+    // 已流出的正文块原地补尾;进度文本与最终正文分叉(理论罕见)时另起完整正文块。
+    if (summaryBlock >= 0) {
+      send('content_block_stop', { type: 'content_block_stop', index: summaryBlock })
+      summaryBlock = -1
+    }
+    const streamedAll = answer.text.startsWith(streamedText)
+    const hasStreamedText = textBlock >= 0
+    let idx = nextBlockIndex
+    if (answer.reasoning) { emitThinkingBlock(idx); idx += 1 }
+    if (hasStreamedText && streamedAll) {
+      const tail = answer.text.slice(streamedText.length)
+      if (tail) writeDelta(textBlock, { type: 'text_delta', text: tail })
+      send('content_block_stop', { type: 'content_block_stop', index: textBlock })
+    } else if (hasStreamedText) {
+      send('content_block_stop', { type: 'content_block_stop', index: textBlock })
+      emitTextBlock(idx, answer.text || '')
+      idx += 1
+    } else {
+      emitTextBlock(idx, answer.text || '')
+      idx += 1
+    }
 
     send('message_delta', {
       type: 'message_delta',

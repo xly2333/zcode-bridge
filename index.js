@@ -736,6 +736,9 @@ export function apply(ctx, config) {
   function progressFor(item, events) {
     const rec = tracked.get(item.messageId)
     if (!rec || rec.cancelled || !Number.isSafeInteger(rec.turn)) return
+    // 2026-11-19 防御:会话句柄异常时 sessionEvents 可能返回 undefined,这里直接跳过
+    // 而不是让 events.filter 抛 TypeError 打满 tick-err。
+    if (!Array.isArray(events)) return
     const fresh = events.filter(event => Number.isSafeInteger(event?.seq) && event.seq > item.progressSeq && event.data?.turn === rec.turn)
     if (!fresh.length) return
     item.progressSeq = Math.max(item.progressSeq ?? item.baselineSeq, ...fresh.map(event => event.seq))
@@ -756,7 +759,10 @@ export function apply(ctx, config) {
       if (Array.isArray(blocks)) {
         item.progressText = item.progressText || ''
         for (const block of blocks) {
-          if ((block?.type === 'text' || block?.type === 'reasoning') && typeof block.text === 'string') {
+          // 2026-11-19 契约修正:只累加 text 块。reasoning 块此前也被累进 progressText,
+          // 桌面端会把思考内容当正文流式渲染(与 DSH 侧 reasoning-delta 修复同源的问题,
+          // 只是发生在 progress 通道)。
+          if (block?.type === 'text' && typeof block.text === 'string') {
             const seen = item.progressBlocks || (item.progressBlocks = new Set())
             const key = `${event.seq}:${block.type}:${block.text}`
             if (!seen.has(key)) {
@@ -767,7 +773,7 @@ export function apply(ctx, config) {
         }
       }
     }
-    void post('/progress', { 
+    void post('/progress', {
       eventId: item.evt?.id,
       messageId: item.messageId,
       sessionId: item.evt?.sessionId,
