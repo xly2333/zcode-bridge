@@ -32,3 +32,10 @@ then restart DSH. First start derives the bridge token and listens on
   key changed per turn, creating a new DSH session every message and losing
   all context).
 - endpoint probe logs include `msgs=` and `session=` for verification.
+
+## 一键安装包（Release）
+
+Releases 页提供完整套件压缩包（dsh-zcode-cli + zcode-bridge + install.mjs 一体）：
+**https://github.com/xly2333/zcode-bridge/releases**
+
+下载解压后执行 `node install.mjs` 即完成安装，重启 DSH 生效。
