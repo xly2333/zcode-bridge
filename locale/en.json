@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "ZCode bridge",
+    "description": "Turns ZCode hook events into DSH turns so a phone can drive this Harness, and sends each reply back to ZCode."
+  }
+}

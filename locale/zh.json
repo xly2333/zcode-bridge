@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "ZCode 桥接",
+    "description": "把 ZCode 收到的用户消息转成 DSH 会话输入，手机即可远程操控；每轮回复再回推给 ZCode。"
+  }
+}

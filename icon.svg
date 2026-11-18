@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="ZCode bridge">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2b6cf6"/>
+      <stop offset="1" stop-color="#7a3cf0"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#bg)"/>
+  <rect x="12" y="16" width="16" height="24" rx="3" fill="#fff" opacity="0.95"/>
+  <rect x="36" y="24" width="16" height="24" rx="3" fill="#fff" opacity="0.95"/>
+  <path d="M28 28h8" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
+  <path d="M32 24v8" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="20" cy="46" r="2.5" fill="#fff"/>
+  <circle cx="44" cy="46" r="2.5" fill="#fff"/>
+</svg>

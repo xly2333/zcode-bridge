@@ -1,0 +1,22 @@
+- insert:
+    - id: zcode-bridge
+      name: '@local/zcode-bridge'
+      config:
+        # Both forwarding servers live in the DSH host and stop with this plugin.
+        autoServices: true
+        gatewayHost: '127.0.0.1'
+        bridgePort: 47821
+        endpointPort: 47830
+        persistState: true
+        stateDir: ''
+        startupRetryMs: 2000
+        bridgeUrl: 'http://127.0.0.1:47821'
+        pollIntervalMs: 1200
+        injectAsUser: true
+        forwardResults: true
+        preferSteer: true
+        tagSource: false
+        followSession: true
+        followCancel: true
+        followFork: true
+        agentPreset: ''

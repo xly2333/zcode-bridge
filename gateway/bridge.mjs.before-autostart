@@ -1,0 +1,389 @@
+// zcode-bridge: 本地事件中转站
+// ZCode hook (UserPromptSubmit / Stop) --HTTP POST--> 本服务 --> DSH 插件租约拉取 + ack
+// 只写内存队列 + 可选落盘，不触碰 zcode 任何文件。
+import { createServer } from 'node:http'
+import { randomUUID, timingSafeEqual } from 'node:crypto'
+import { appendFile, mkdirSync, readFileSync, writeFileSync, existsSync, renameSync, statSync } from 'node:fs'
+import { join } from 'node:path'
+import { homedir } from 'node:os'
+
+const PORT = Number(process.env.ZCODE_BRIDGE_PORT || 47821)
+const HOST = process.env.ZCODE_BRIDGE_HOST || '127.0.0.1'
+const STATE_DIR = process.env.ZCODE_BRIDGE_DIR || join(homedir(), '.zcode-bridge')
+const TOKEN_FILE = join(STATE_DIR, 'token')
+const LOG_FILE = join(STATE_DIR, 'events.jsonl')
+const LOG_MAX_BYTES = 8 * 1024 * 1024
+const LEASE_MS = 60_000
+const MAX_PROMPT_CHARS = 2_000_000 // 完整转发优先：上限抬到 200 万字，实际几乎不会触发截断
+
+mkdirSync(STATE_DIR, { recursive: true })
+
+let TOKEN
+if (existsSync(TOKEN_FILE)) {
+  TOKEN = readFileSync(TOKEN_FILE, 'utf8').trim()
+} else {
+  TOKEN = randomUUID().replaceAll('-', '')
+  writeFileSync(TOKEN_FILE, TOKEN, { mode: 0o600 })
+}
+const TOKEN_BUF = Buffer.from(TOKEN)
+
+/** 待 DSH 消费的入站消息（带租约） */
+const inbound = []
+/** 待回推结果 */
+const outbound = []
+/** messageId -> 最新状态 */
+const statuses = new Map()
+/** 状态流水 */
+const statusLog = []
+
+let seq = 0
+let statusSeq = 0
+let lastPluginStatus = null
+let logBytes = 0
+try {
+  logBytes = existsSync(LOG_FILE) ? statSync(LOG_FILE).size : 0
+} catch {
+  logBytes = 0
+}
+
+function json(res, code, body) {
+  if (res.writableEnded || res.destroyed) return
+  const data = JSON.stringify(body)
+  res.writeHead(code, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(data),
+  })
+  res.end(data)
+}
+
+function readBody(req, limit = 4 * 1024 * 1024, timeoutMs = 10_000) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const chunks = []
+    let size = 0
+    const finish = (fn, v) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      fn(v)
+    }
+    const fail = (e) => finish(reject, e)
+    const timer = setTimeout(() => {
+      fail(new Error('body timeout'))
+      try {
+        req.destroy()
+      } catch {
+        /* ignore */
+      }
+    }, timeoutMs)
+
+    req.on('data', (c) => {
+      size += c.length
+      if (size > limit) {
+        chunks.length = 0
+        fail(new Error('body too large'))
+        try {
+          req.destroy()
+        } catch {
+          /* ignore */
+        }
+        return
+      }
+      chunks.push(c)
+    })
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8')
+      if (!raw) return finish(resolve, {})
+      try {
+        finish(resolve, JSON.parse(raw))
+      } catch (e) {
+        fail(new Error('invalid json: ' + e.message))
+      }
+    })
+    req.on('aborted', () => fail(new Error('aborted')))
+    req.on('close', () => {
+      if (!req.complete) fail(new Error('client closed early'))
+    })
+    req.on('error', fail)
+  })
+}
+
+function authorized(req) {
+  const h = req.headers['authorization'] || ''
+  const t = h.startsWith('Bearer ') ? h.slice(7) : ''
+  const a = Buffer.from(t)
+  return a.length === TOKEN_BUF.length && timingSafeEqual(a, TOKEN_BUF)
+}
+
+function logEvent(rec) {
+  // 只落元数据，避免把用户 prompt 原文长期写盘
+  const slim = {
+    id: rec.id,
+    kind: rec.kind,
+    sessionId: rec.sessionId,
+    turnId: rec.turnId,
+    timestamp: rec.timestamp,
+    promptLen: rec.prompt ? rec.prompt.length : 0,
+  }
+  const line = JSON.stringify(slim) + '\n'
+  logBytes += Buffer.byteLength(line)
+  if (logBytes > LOG_MAX_BYTES) {
+    try {
+      renameSync(LOG_FILE, LOG_FILE + '.1')
+    } catch {
+      /* ignore */
+    }
+    logBytes = 0
+  }
+  appendFile(LOG_FILE, line, () => {})
+}
+
+async function handle(req, res) {
+  let url
+  try {
+    url = new URL(req.url || '/', `http://${HOST}:${PORT}`)
+  } catch {
+    return json(res, 400, { ok: false, error: 'bad url' })
+  }
+
+  if (url.pathname === '/health') {
+    return json(res, 200, { ok: true, service: 'zcode-bridge' })
+  }
+
+  if (!authorized(req)) return json(res, 401, { ok: false, error: 'bad token' })
+
+  // ---- ZCode hook 上报 ----
+  if (url.pathname === '/hook' && req.method === 'POST') {
+    let body
+    try {
+      // 完整转发优先：正文原样、不截断，给到 16MB / 30s
+      body = await readBody(req, 16 * 1024 * 1024, 30_000)
+    } catch (e) {
+      return json(res, 400, { ok: false, error: e.message })
+    }
+    const evt = String(body.hook_event_name || body.hookEventName || '')
+    const rec = {
+      id: `${Date.now()}-${++seq}`,
+      kind: evt,
+      prompt: typeof body.prompt === 'string' ? body.prompt.slice(0, MAX_PROMPT_CHARS) : undefined,
+      images: Array.isArray(body.images) ? body.images.filter((p) => typeof p === 'string') : undefined,
+      sessionId: body.session_id || body.sessionId,
+      turnId: body.turnId,
+      cwd: body.cwd,
+      requestId: body.request_id,
+      fork: body.fork === true,
+      forkAt: Number.isFinite(Number(body.forkAt)) ? Number(body.forkAt) : undefined,
+      // ZCode 侧完整对话历史，插件在新会话首次注入时回灌到 DSH 会话
+      history: Array.isArray(body.history)
+        ? body.history
+            .filter((h) => h && (h.role === 'user' || h.role === 'assistant') && typeof h.text === 'string' && h.text)
+            .map((h) => ({ role: h.role, text: h.text }))
+        : undefined,
+      cancelled: false,
+      timestamp: body.timestamp || new Date().toISOString(),
+      source: body.source,
+      attachmentsSummary: body.attachmentsSummary,
+      responseText: typeof body.responseText === 'string' ? body.responseText : undefined,
+      leasedUntil: 0,
+    }
+    if (evt === 'UserPromptSubmit' || evt === 'Stop' || evt === 'SessionStart') {
+      inbound.push(rec)
+      logEvent(rec)
+      while (inbound.length > 200) inbound.shift()
+    }
+    return json(res, 200, { ok: true, id: rec.id, kind: rec.kind })
+  }
+
+  // ---- 租约拉取：不删除，靠 ack 确认 ----
+  if (url.pathname === '/pull' && req.method === 'GET') {
+    const n = Math.min(Math.max(Number(url.searchParams.get('max')) || 20, 1), 100)
+    const now = Date.now()
+    const batch = []
+    for (const rec of inbound) {
+      if (batch.length >= n) break
+      if (rec.leasedUntil && rec.leasedUntil > now) continue
+      rec.leasedUntil = now + LEASE_MS
+      batch.push(rec)
+    }
+    return json(res, 200, { ok: true, events: batch, leaseMs: LEASE_MS })
+  }
+
+  // ---- 显式确认：确认后才真正删除 ----
+  if (url.pathname === '/ack' && req.method === 'POST') {
+    let body
+    try {
+      body = await readBody(req)
+    } catch (e) {
+      return json(res, 400, { ok: false, error: e.message })
+    }
+    const ids = new Set(Array.isArray(body?.ids) ? body.ids : [])
+    let removed = 0
+    for (let i = inbound.length - 1; i >= 0; i--) {
+      if (ids.has(inbound[i].id)) {
+        inbound.splice(i, 1)
+        removed++
+      }
+    }
+    return json(res, 200, { ok: true, acked: removed })
+  }
+
+  // ---- 取消：端点感知到客户端断开时调用，标记该事件让插件去 cancel agent ----
+  if (url.pathname === '/cancel' && req.method === 'POST') {
+    let body
+    try {
+      body = await readBody(req)
+    } catch (e) {
+      return json(res, 400, { ok: false, error: e.message })
+    }
+    const eventId = String(body?.eventId || '')
+    const requestId = String(body?.requestId || '')
+    let hit = 0
+    for (const rec of inbound) {
+      if ((eventId && rec.id === eventId) || (requestId && rec.requestId === requestId)) {
+        rec.cancelled = true
+        rec.cancelReason = String(body?.reason || 'user-cancel')
+        rec.cancelledAt = new Date().toISOString()
+        hit++
+      }
+    }
+    // 已经在插件手里（被租约走）的，也要让下一次 /pull 能带过去，
+    // 所以额外压一条 cancel 事件进队
+    const cancelRec = {
+      id: `${Date.now()}-${++seq}`,
+      kind: 'Cancel',
+      targetEventId: eventId,
+      targetRequestId: requestId,
+      reason: String(body?.reason || 'user-cancel'),
+      sessionId: body?.sessionId,
+      timestamp: new Date().toISOString(),
+      leasedUntil: 0,
+    }
+    if (eventId || requestId) inbound.push(cancelRec)
+    return json(res, 200, { ok: true, marked: hit, cancelEventId: cancelRec.id })
+  }
+
+  // ---- 逐条状态上报 ----
+  if (url.pathname === '/status' && req.method === 'POST') {    let body
+    try {
+      body = await readBody(req)
+    } catch (e) {
+      return json(res, 400, { ok: false, error: e.message })
+    }
+    const mid = String(body.messageId || '')
+    if (mid) {
+      const rec = { ...body, seq: ++statusSeq, at: body.at || new Date().toISOString() }
+      statuses.set(mid, rec)
+      statusLog.push(rec)
+      while (statusLog.length > 1000) statusLog.shift()
+      if (statuses.size > 500) {
+        for (const k of [...statuses.keys()].slice(0, 200)) statuses.delete(k)
+      }
+    }
+    return json(res, 200, { ok: true })
+  }
+
+  if (url.pathname === '/status' && req.method === 'GET') {
+    const since = Number(url.searchParams.get('since') || 0)
+    return json(res, 200, { ok: true, cursor: statusSeq, rows: statusLog.filter((r) => r.seq > since) })
+  }
+
+  if (url.pathname === '/plugin-status' && req.method === 'POST') {
+    let body
+    try {
+      body = await readBody(req)
+    } catch (e) {
+      return json(res, 400, { ok: false, error: e.message })
+    }
+    lastPluginStatus = { ...body, at: new Date().toISOString() }
+    return json(res, 200, { ok: true })
+  }
+
+  if (url.pathname === '/plugin-status' && req.method === 'GET') {
+    return json(res, 200, {
+      ok: true,
+      status: lastPluginStatus,
+      counts: { inbound: inbound.length, outbound: outbound.length, statuses: statuses.size },
+    })
+  }
+
+  if (url.pathname === '/push-result' && req.method === 'POST') {
+    let body
+    try {
+      // 完整转发优先：思考+正文可能很长，给到 64MB / 60s，避免 body too large 丢内容
+      body = await readBody(req, 64 * 1024 * 1024, 60_000)
+    } catch (e) {
+      return json(res, 400, { ok: false, error: e.message })
+    }
+    const rec = {
+      id: `${Date.now()}-r${++seq}`,
+      text: String(body.text || ''),
+      reasoning: String(body.reasoning || ''),
+      sessionId: body.sessionId,
+      forEventId: body.forEventId,
+      messageId: body.messageId,
+      timestamp: new Date().toISOString(),
+    }
+    outbound.push(rec)
+    while (outbound.length > 200) outbound.shift()
+    return json(res, 200, { ok: true, id: rec.id })
+  }
+
+  if (url.pathname === '/results' && req.method === 'GET') {
+    const max = Math.min(Number(url.searchParams.get('max') || 20), 100)
+    const forEventId = url.searchParams.get('forEventId') || ''
+    if (forEventId) {
+      // 精确配对：只取这条事件的回推，其余留在队里
+      const picked = []
+      for (let i = 0; i < outbound.length && picked.length < max; i++) {
+        if (outbound[i]?.forEventId === forEventId) {
+          picked.push(outbound[i])
+          outbound.splice(i, 1)
+          i--
+        }
+      }
+      return json(res, 200, { ok: true, results: picked })
+    }
+    const batch = outbound.splice(0, max)
+    return json(res, 200, { ok: true, results: batch })
+  }
+
+  // ---- 清空残留（旧客户端兼容） ----
+  if (url.pathname === '/results/drain' && req.method === 'POST') {
+    const n = outbound.length
+    outbound.length = 0
+    return json(res, 200, { ok: true, drained: n })
+  }
+
+  json(res, 404, { ok: false, error: 'not found' })
+}
+
+const server = createServer((req, res) => {
+  handle(req, res).catch((err) => {
+    console.error('[zcode-bridge] handler failed:', err?.message ?? err)
+    try {
+      json(res, 500, { ok: false, error: 'internal error' })
+    } catch {
+      /* ignore */
+    }
+  })
+})
+
+server.on('clientError', (err, socket) => {
+  if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')
+})
+
+server.on('error', (err) => {
+  console.error(`[zcode-bridge] server error: ${err?.code || ''} ${err?.message || err}`)
+  // 2026-11-17 固化进 dsh-bundle:端口被占(如遗留的外部服务)不再杀 DSH 进程,
+  // 只跳过监听 —— 随 DSH 启停,端口释放由进程退出保证。
+})
+
+process.on('unhandledRejection', (e) => {
+  console.error('[zcode-bridge] unhandledRejection:', e?.message ?? e)
+})
+
+server.listen(PORT, HOST, () => {
+  console.log(`[zcode-bridge] listening http://${HOST}:${PORT}`)
+  console.log(`[zcode-bridge] state dir ${STATE_DIR}`)
+  console.log(`[zcode-bridge] token file ${TOKEN_FILE}`)
+})
