@@ -701,9 +701,18 @@ async function askDsh({ text, images, files, sessionId, cwd, rewrite, abort, req
           })
           if (progress.ok) {
             const updates = await progress.json()
-            for (const update of updates.rows || []) {
+            const rows = updates.rows || []
+            for (const update of rows) {
               state.progressCursor = Math.max(state.progressCursor || 0, Number(update.progressSeq) || 0)
               onProgress(update)
+            }
+            // 2026-11-20 空闲心跳:GLM 思考阶段可能几十秒没有任何 progress 行,
+            // 桌面端 SDK 会在 ~25s 空闲时掐断 SSE(实测第一个字到达的同毫秒失败)。
+            // 没有新行时定期发一次心跳;onProgress 侧自己限频,不支持心跳的
+            // 旧路由会因字段不认识而自然忽略。
+            if (rows.length === 0 && Date.now() - (state.lastHeartbeatAt || 0) > 4000) {
+              state.lastHeartbeatAt = Date.now()
+              onProgress({ heartbeat: true, events: [], summaries: [] })
             }
           } else await progress.body?.cancel?.()
           } catch { /* progress is best-effort; final response remains authoritative */ }
@@ -1043,18 +1052,49 @@ async function handle(req, res) {
     const responseId = `resp_${randomUUID().replaceAll('-', '').slice(0, 16)}`
     const stream = body?.stream === true
     let streamedText = ''
+    let streamedReasoning = ''
+    let reasoningItemId = null
+    let lastWriteAt = Date.now()
+    // 2026-11-20 思考流:progress 行的 reasoning 字段映射为桌面端 SDK 认识的
+    // response.reasoning_summary_* 事件(zcode.cjs 的 zod schema 逐字匹配)。
+    // 之前路由只转发 output_text,GLM 思考的十几秒里 SSE 一个字节都没有,
+    // 桌面端在 ~25s 空闲时把连接掐死——实测死于第一个字到达的同毫秒。
+    const writeEvent = (obj) => {
+      lastWriteAt = Date.now()
+      res.write(`event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`)
+    }
+    const ensureReasoningItem = () => {
+      if (reasoningItemId === null) {
+        reasoningItemId = `rs_${randomUUID().replaceAll('-', '').slice(0, 16)}`
+        writeEvent({ type: 'response.reasoning_summary_part.added', item_id: reasoningItemId, summary_index: 0 })
+      }
+      return reasoningItemId
+    }
     let sendProgress
     if (stream) {
       res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive' })
       sendProgress = (update) => {
         if (res.writableEnded || !res.writable) return
+        // 心跳:思考/工具静默期保活,防止桌面端空闲超时;3.5s 限频。
+        if (update.heartbeat === true) {
+          if (Date.now() - lastWriteAt > 3500) {
+            writeEvent({ type: 'response.in_progress', response_id: responseId, dsh_progress: { turn: update.turn, events: update.events || [], summaries: update.summaries || [] } })
+          }
+          return
+        }
+        if (typeof update.reasoning === 'string' && update.reasoning.length > streamedReasoning.length) {
+          const itemId = ensureReasoningItem()
+          const rdelta = update.reasoning.slice(streamedReasoning.length)
+          streamedReasoning = update.reasoning
+          if (rdelta) writeEvent({ type: 'response.reasoning_summary_text.delta', item_id: itemId, summary_index: 0, delta: rdelta })
+        }
         if (typeof update.text === 'string' && update.text.startsWith(streamedText)) {
           const delta = update.text.slice(streamedText.length)
           streamedText = update.text
-          if (delta) res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', item_id: outputId, output_index: 0, content_index: 0, delta })}\n\n`)
+          if (delta) writeEvent({ type: 'response.output_text.delta', item_id: outputId, output_index: 0, content_index: 0, delta })
         }
         if (Array.isArray(update.events) && update.events.some(type => type.startsWith('tool/'))) {
-          res.write(`event: response.in_progress\ndata: ${JSON.stringify({ type: 'response.in_progress', response_id: responseId, dsh_progress: { turn: update.turn, events: update.events, summaries: update.summaries || [] } })}\n\n`)
+          writeEvent({ type: 'response.in_progress', response_id: responseId, dsh_progress: { turn: update.turn, events: update.events, summaries: update.summaries || [] } })
         }
       }
       res.write(`event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { id: responseId, object: 'response', status: 'in_progress', output: [] } })}\n\n`)
@@ -1079,6 +1119,17 @@ async function handle(req, res) {
       answer = { text: `[DSH 未返回] ${e.message}`, reasoning: '' }
     } finally {
       state.cleanup()
+    }
+    if (stream && typeof answer.reasoning === 'string' && answer.reasoning) {
+      // 2026-11-20 完成时补发思考:progress 通道是 step 粒度,最后一步的思考
+      // 可能还没流过;这里把剩余部分一次性补齐再发正文,桌面端的历史里思考完整。
+      const itemId = ensureReasoningItem()
+      if (answer.reasoning.length > streamedReasoning.length) {
+        const rdelta = answer.reasoning.slice(streamedReasoning.length)
+        streamedReasoning = answer.reasoning
+        if (rdelta) writeEvent({ type: 'response.reasoning_summary_text.delta', item_id: itemId, summary_index: 0, delta: rdelta })
+      }
+      writeEvent({ type: 'response.reasoning_summary_part.done', item_id: itemId, summary_index: 0 })
     }
     if (stream && answer.text.startsWith(streamedText)) {
       const delta = answer.text.slice(streamedText.length)

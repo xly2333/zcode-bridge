@@ -770,6 +770,17 @@ export function apply(ctx, config) {
               item.progressText += block.text
             }
           }
+          // 2026-11-20 思考流恢复:reasoning 单独走自己的字段,不再混进 text。
+          // 网关 /responses 现在能把它映射成桌面端 SDK 认识的
+          // response.reasoning_summary_* SSE 事件;/v1/messages 也用它补 finalize。
+          if (block?.type === 'reasoning' && typeof block.text === 'string' && block.text) {
+            const seen = item.progressReasoningBlocks || (item.progressReasoningBlocks = new Set())
+            const key = `${event.seq}:reasoning:${block.text}`
+            if (!seen.has(key)) {
+              seen.add(key)
+              item.progressReasoning = (item.progressReasoning || '') + block.text
+            }
+          }
         }
       }
     }
@@ -781,6 +792,7 @@ export function apply(ctx, config) {
       seq: item.progressSeq,
       events: [...new Set(fresh.map(event => event.type).filter(type => typeof type === 'string'))],
       text: item.progressText || undefined,
+      reasoning: item.progressReasoning || undefined,
       summaries: summaries.length ? summaries : undefined,
     })
   }
