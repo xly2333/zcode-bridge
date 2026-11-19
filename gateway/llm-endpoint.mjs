@@ -1066,6 +1066,12 @@ async function handle(req, res) {
     const ensureReasoningItem = () => {
       if (reasoningItemId === null) {
         reasoningItemId = `rs_${randomUUID().replaceAll('-', '').slice(0, 16)}`
+        // 2026-11-20 关键补丁:桌面端只在 response.output_item.added(item.type=reasoning)
+        // 时注册 reasoning 条目($[item.id]={summaryParts:{0:'active'}}),而后续的
+        // reasoning_summary_part.done 会无条件读 $[item_id].summaryParts——
+        // 不先注册,思考流一发完就在收尾瞬间 undefined.summaryParts 崩掉,
+        // 整个回合 reason=unknown retryable=false 直接死,正文永远送不到。
+        writeEvent({ type: 'response.output_item.added', output_index: 0, item: { id: reasoningItemId, type: 'reasoning' } })
         writeEvent({ type: 'response.reasoning_summary_part.added', item_id: reasoningItemId, summary_index: 0 })
       }
       return reasoningItemId
@@ -1130,6 +1136,10 @@ async function handle(req, res) {
         if (rdelta) writeEvent({ type: 'response.reasoning_summary_text.delta', item_id: itemId, summary_index: 0, delta: rdelta })
       }
       writeEvent({ type: 'response.reasoning_summary_part.done', item_id: itemId, summary_index: 0 })
+      // reasoning 条目正式收尾:桌面端在 output_item.done(reasoning) 里遍历
+      // summaryParts 把 active/can-conclude 分片 enqueue 成 reasoning-end,
+      // 思考块才会完整闭合(已 concluded 的分片不会重复发 end)。
+      writeEvent({ type: 'response.output_item.done', output_index: 0, item: { id: itemId, type: 'reasoning' } })
     }
     if (stream && answer.text.startsWith(streamedText)) {
       const delta = answer.text.slice(streamedText.length)
