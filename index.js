@@ -296,6 +296,24 @@ export function apply(ctx, config) {
   async function sweepSessions() {
     const now = Date.now()
     for (const [sid, rec] of [...sessionAgents]) {
+      // 2026-11-20 分组自愈:外部某处会把桥会话写进归档集(灰显沉底)。每个 tick
+      // 对活映射的会话再断言一次;registry 的 mutate 对 no-op 幂等,无写放大。
+      try {
+        const registry = ctx.get?.('workspaceRegistry')
+        const agentId = rec.agent?.session?.id
+        if (registry && agentId) {
+          const archived = Array.isArray(registry.archivedSessionIds) && registry.archivedSessionIds.includes(agentId)
+          const ws = typeof registry.list === 'function' ? registry.list()[0] : undefined
+          const attached = ws && Array.isArray(ws.record?.sessionIds) && ws.record.sessionIds.includes(agentId)
+          if (archived || attached === false) {
+            if (archived && typeof registry.unarchiveSession === 'function') await registry.unarchiveSession(agentId)
+            if (ws && typeof ws.attachSession === 'function') await ws.attachSession(agentId)
+            debugLog('workspace-heal', `id=${agentId} wasArchived=${archived} wasAttached=${attached === true}`)
+          }
+        }
+      } catch {
+        /* 分组自愈失败不阻塞回收主流程 */
+      }
       if (now - (rec.lastUsedAt || 0) < SESSION_IDLE_MS) continue
       if (hasPendingFor(rec.agent)) continue
       sessionAgents.delete(sid)
@@ -494,6 +512,29 @@ export function apply(ctx, config) {
 
       // fork 时把旧会话还给它自己保留（append-only 历史可回溯），只替换映射
       sessionAgents.set(zcodeSessionId, { agent, handle, lastUsedAt: Date.now() })
+
+      // 2026-11-20 分组修复:桥建的会话不显式 attach 进工作区时,DSH 侧栏把它们
+      // 沉到「未分组」最底下,还会被写进 workspace.json 的 archivedSessionIds
+      // (灰显、不可点开)。创建成功后立即:反归档 + attach 到工作区(workspace
+      // 的 attachSession 自己会校验会话头部的 cwd 是否等于工作区路径,不匹配会
+      // 抛错,这里 catch 住只记日志,绝不让分组问题影响转发主流程)。
+      try {
+        const registry = ctx.get?.('workspaceRegistry')
+        if (registry) {
+          if (typeof registry.unarchiveSession === 'function') await registry.unarchiveSession(newId)
+          const ws = typeof registry.list === 'function' ? registry.list()[0] : undefined
+          if (ws && typeof ws.attachSession === 'function') {
+            await ws.attachSession(newId)
+            debugLog('workspace-attach', `id=${newId} ws=${ws.record?.path ?? '?'} cwd=${cwd ?? '-'}`)
+          } else {
+            debugLog('workspace-skip', `id=${newId} registry 无可用的 workspace 实体`)
+          }
+        } else {
+          debugLog('workspace-skip', `id=${newId} ctx 无 workspaceRegistry`)
+        }
+      } catch (e) {
+        debugLog('workspace-attach-err', `id=${newId} :: ${e?.stack ?? e?.message ?? e}`)
+      }
       console.log(
         `[zcode-bridge] 为 ZCode 会话 ${zcodeSessionId} 新建了 DSH 会话 ${newId}` +
           (wantFork ? '（fork）' : ''),
